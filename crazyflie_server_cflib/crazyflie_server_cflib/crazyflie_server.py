@@ -10,6 +10,7 @@ from cflib.crazyflie.log import LogConfig
 from cflib.crazyflie.mem import MemoryElement, Poly4D
 from cflib.crazyflie.swarm import CachedCfFactory, Swarm
 import cflib.crtp
+from cflib.utils.encoding import decompress_quaternion
 from crazyflie_interfaces.msg import (
     FullState,
     Hover,
@@ -44,6 +45,16 @@ from tf2_ros import TransformBroadcaster
 
 
 GRAVITY = 9.80665
+
+
+def rotate_by_inverse_quaternion(q, v):
+    """Rotate vector v by the inverse of unit quaternion q = [x, y, z, w] (world -> body)."""
+    ux, uy, uz, w = -q[0], -q[1], -q[2], q[3]
+    # v' = v + 2w (u x v) + 2 u x (u x v)
+    cx, cy, cz = uy * v[2] - uz * v[1], uz * v[0] - ux * v[2], ux * v[1] - uy * v[0]
+    return (v[0] + 2 * (w * cx + uy * cz - uz * cy),
+            v[1] + 2 * (w * cy + uz * cx - ux * cz),
+            v[2] + 2 * (w * cz + ux * cy - uy * cx))
 
 
 def quaternion_from_euler(roll, pitch, yaw):
@@ -128,19 +139,20 @@ class CrazyflieServer(Node):
                 'stabilizer.yaw',
             ],
             'scan': ['range.front', 'range.left', 'range.back', 'range.right'],
+            # Compressed estimator state (22 bytes, fits one log block): position [mm],
+            # attitude quaternion, world-frame velocity [mm/s], body rates [mrad/s].
+            # Same source as the C++ backend.
             'odom': [
-                'stateEstimate.x',
-                'stateEstimate.y',
-                'stateEstimate.z',
-                'stabilizer.yaw',
-                'stabilizer.roll',
-                'stabilizer.pitch',
-                'kalman.statePX',
-                'kalman.statePY',
-                'kalman.statePZ',
-                'gyro.z',
-                'gyro.x',
-                'gyro.y',
+                'stateEstimateZ.x',
+                'stateEstimateZ.y',
+                'stateEstimateZ.z',
+                'stateEstimateZ.quat',
+                'stateEstimateZ.vx',
+                'stateEstimateZ.vy',
+                'stateEstimateZ.vz',
+                'stateEstimateZ.rateRoll',
+                'stateEstimateZ.ratePitch',
+                'stateEstimateZ.rateYaw',
             ],
             'status': ['supervisor.info', 'pm.vbatMV', 'pm.state', 'radio.rssi'],
             'imu': [
@@ -471,10 +483,7 @@ class CrazyflieServer(Node):
 
         lg = LogConfig(name=prefix, period_in_ms=1000 / logging_freq)
         for logvar in list_logvar:
-            if prefix == 'odom':
-                lg.add_variable(logvar, 'FP16')
-            else:
-                lg.add_variable(logvar)
+            lg.add_variable(logvar)
 
         self.swarm._cfs[link_uri].logging[prefix + '_logging_enabled'] = logging_enabled
         self.swarm._cfs[link_uri].logging[prefix + '_logging_freq'] = logging_freq
@@ -746,23 +755,24 @@ class CrazyflieServer(Node):
             self.swarm._cfs[uri].logging['imu_log_config'].stop()
 
     def _log_odom_data_callback(self, timestamp, data, logconf, uri):
-        """Publish odometry data retrieved from the Crazyflie."""
+        """
+        Publish odometry data retrieved from the Crazyflie.
+
+        Pose in the world frame; twist in the body frame (nav_msgs/Odometry convention: twist is
+        expressed in child_frame_id), angular rates in rad/s.
+        """
         cf_name = self.cf_dict[uri]
 
-        x = data.get('stateEstimate.x')
-        y = data.get('stateEstimate.y')
-        z = data.get('stateEstimate.z')
-        yaw = radians(data.get('stabilizer.yaw'))
-        roll = radians(data.get('stabilizer.roll'))
-        pitch = radians(data.get('stabilizer.pitch'))
-        vx = data.get('kalman.statePX')
-        vy = data.get('kalman.statePY')
-        vz = data.get('kalman.statePZ')
-        yawrate = data.get('gyro.z')
-        rollrate = data.get('gyro.x')
-        pitchrate = data.get('gyro.y')
+        x = data.get('stateEstimateZ.x') / 1000.0
+        y = data.get('stateEstimateZ.y') / 1000.0
+        z = data.get('stateEstimateZ.z') / 1000.0
+        q = decompress_quaternion(data.get('stateEstimateZ.quat'))  # x, y, z, w
+        v_world = [data.get('stateEstimateZ.v' + a) / 1000.0 for a in 'xyz']
+        vx, vy, vz = rotate_by_inverse_quaternion(q, v_world)
+        rollrate = data.get('stateEstimateZ.rateRoll') / 1000.0
+        pitchrate = data.get('stateEstimateZ.ratePitch') / 1000.0
+        yawrate = data.get('stateEstimateZ.rateYaw') / 1000.0
 
-        q = quaternion_from_euler(roll, pitch, yaw)
         msg = Odometry()
         msg.child_frame_id = cf_name
         msg.header.stamp = self.get_clock().now().to_msg()
