@@ -1311,14 +1311,21 @@ public:
             broadcaster_.emplace(broadcastUri, std::make_unique<CrazyflieBroadcaster>(broadcastUri));
           }
 
-          crazyflies_.emplace(name, std::make_unique<CrazyflieROS>(
-            uri,
-            cf_type,
-            name,
-            this,
-            callback_group_cf_cmd_,
-            callback_group_cf_srv_,
-            broadcaster_.at(broadcastUri).get()));
+          // a lost packet makes setup time out; skip the drone instead of aborting the swarm.
+          // shortcut: no retry (the constructor declares ROS params, a 2nd attempt would re-declare them)
+          try {
+            crazyflies_.emplace(name, std::make_unique<CrazyflieROS>(
+              uri,
+              cf_type,
+              name,
+              this,
+              callback_group_cf_cmd_,
+              callback_group_cf_srv_,
+              broadcaster_.at(broadcastUri).get()));
+          } catch (const std::exception& e) {
+            RCLCPP_ERROR(logger_, "[%s] Connection failed, continuing without it: %s", name.c_str(), e.what());
+            continue;
+          }
 
           update_name_to_id_map(name, crazyflies_[name]->id());
         }
