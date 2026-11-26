@@ -1,3 +1,4 @@
+#include <Eigen/Geometry>
 #include <memory>
 #include <vector>
 #include <regex>
@@ -138,9 +139,13 @@ private:
     int16_t vx;
     int16_t vy;
     int16_t vz;
-    //int16_t rateRoll;  
-    //int16_t ratePitch;
-    //int16_t rateYaw;
+  } __attribute__((packed));
+
+  // separate block: with the rates, the odom block request exceeds one CRTP packet
+  struct logOdomRates {
+    int16_t rateRoll;  // mrad/s
+    int16_t ratePitch;
+    int16_t rateYaw;
   } __attribute__((packed));
 
 
@@ -234,19 +239,17 @@ public:
       publisher_robot_description_->publish(std::move(msg));
     }
 
-    // spinning timer
-    // used to process all incoming radio messages
-    spin_timer_ =
-      node->create_wall_timer(
-      std::chrono::milliseconds(1),
-      std::bind(&CrazyflieROS::spin_once, this), callback_group_cf_srv);
-
     // link statistics
     warning_freq_ = node->get_parameter("warnings.frequency").get_parameter_value().get<float>();
     max_latency_ = node->get_parameter("warnings.communication.max_unicast_latency").get_parameter_value().get<float>();
     min_ack_rate_ = node->get_parameter("warnings.communication.min_unicast_ack_rate").get_parameter_value().get<float>();
     min_unicast_receive_rate_ = node->get_parameter("warnings.communication.min_unicast_receive_rate").get_parameter_value().get<float>();
     min_broadcast_receive_rate_ = node->get_parameter("warnings.communication.min_broadcast_receive_rate").get_parameter_value().get<float>();
+    if (link_uri.rfind("udp://", 0) == 0) {
+      // simulators (udp://) don't count received radio packets, so receive rates are meaningless
+      min_unicast_receive_rate_ = 0;
+      min_broadcast_receive_rate_ = 0;
+    }
     publish_stats_ = node->get_parameter("warnings.communication.publish_stats").get_parameter_value().get<bool>();
     if (publish_stats_) {
       publisher_connection_stats_ = node->create_publisher<crazyflie_interfaces::msg::ConnectionStatisticsArray>(name + "/connection_statistics", 10);
@@ -497,11 +500,17 @@ public:
                 {"stateEstimateZ", "vx"},
                 {"stateEstimateZ", "vy"},
                 {"stateEstimateZ", "vz"},
-                //{"stateEstimateZ", "rateRoll"},
-                //{"stateEstimateZ", "ratePitch"},
-                //{"stateEstimateZ", "rateYaw"}
               }, cb));
             log_block_odom_->start(uint8_t(100.0f / (float)freq)); // this is in tens of milliseconds
+
+            std::function<void(uint32_t, const logOdomRates*)> cb_rates = [this](uint32_t, const logOdomRates* data) { odom_rates_ = *data; };
+            log_block_odom_rates_.reset(new LogBlock<logOdomRates>(
+              &cf_,{
+                {"stateEstimateZ", "rateRoll"},
+                {"stateEstimateZ", "ratePitch"},
+                {"stateEstimateZ", "rateYaw"}
+              }, cb_rates));
+            log_block_odom_rates_->start(uint8_t(100.0f / (float)freq));
             
           }
           else if (i.first.find("default_topics.status") == 0) {
@@ -970,7 +979,10 @@ private:
     if (publisher_odom_) {
       nav_msgs::msg::Odometry msg;
       msg.header.stamp = node_->get_clock()->now();
-      msg.header.frame_id = name_;
+      // same as the cflib backend: pose in the reference frame; twist in the body frame
+      // (nav_msgs/Odometry convention: twist is expressed in child_frame_id)
+      msg.header.frame_id = reference_frame_;
+      msg.child_frame_id = name_;
       msg.pose.pose.position.x = data->x / 1000.0f;
       msg.pose.pose.position.y = data->y / 1000.0f;
       msg.pose.pose.position.z = data->z / 1000.0f;
@@ -982,12 +994,16 @@ private:
       msg.pose.pose.orientation.z = q[2];
       msg.pose.pose.orientation.w = q[3];
 
-      msg.twist.twist.linear.x = data->vx / 1000.0f;
-      msg.twist.twist.linear.y = data->vy / 1000.0f;
-      msg.twist.twist.linear.z = data->vz / 1000.0f;
-      //msg.twist.twist.angular.x = data->rateRoll / 1000.0f;
-      //msg.twist.twist.angular.y = data->ratePitch / 1000.0f;
-      //msg.twist.twist.angular.z = data->rateYaw / 1000.0f;
+      // stateEstimateZ.v* is world-frame [mm/s]: rotate into the body frame
+      Eigen::Quaternionf attitude(q[3], q[0], q[1], q[2]);
+      Eigen::Vector3f v_body = attitude.conjugate() * Eigen::Vector3f(data->vx, data->vy, data->vz) / 1000.0f;
+      msg.twist.twist.linear.x = v_body.x();
+      msg.twist.twist.linear.y = v_body.y();
+      msg.twist.twist.linear.z = v_body.z();
+      // latest sample of the rates block (same rate, so at most one period old)
+      msg.twist.twist.angular.x = odom_rates_.rateRoll / 1000.0f;
+      msg.twist.twist.angular.y = odom_rates_.ratePitch / 1000.0f;
+      msg.twist.twist.angular.z = odom_rates_.rateYaw / 1000.0f;
 
       publisher_odom_->publish(msg);
     }
@@ -1166,6 +1182,8 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr publisher_scan_;
 
   std::unique_ptr<LogBlock<logOdom>> log_block_odom_;
+  std::unique_ptr<LogBlock<logOdomRates>> log_block_odom_rates_;
+  logOdomRates odom_rates_{};
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr publisher_odom_;
 
   std::unique_ptr<LogBlock<logStatus>> log_block_status_;
@@ -1186,7 +1204,6 @@ private:
 
   // multithreading
   rclcpp::CallbackGroup::SharedPtr callback_group_cf_;
-  rclcpp::TimerBase::SharedPtr spin_timer_;
 
   // link statistics
   rclcpp::TimerBase::SharedPtr link_statistics_timer_;
@@ -1314,6 +1331,15 @@ public:
         }
       }
     }
+
+    // process all incoming radio messages: one timer for all Crazyflies instead of one each.
+    // They share a mutually exclusive callback group anyway, and each executor wakeup is
+    // costly, so this cuts the server's CPU use with many Crazyflies.
+    spin_timer_ = this->create_wall_timer(std::chrono::milliseconds(1), [this]() {
+      for (auto& cf : crazyflies_) {
+        cf.second->spin_once();
+      }
+    }, callback_group_cf_srv_);
 
     this->declare_parameter("poses_qos_deadline", 100.0f);
     double poses_qos_deadline = this->get_parameter("poses_qos_deadline").get_parameter_value().get<double>();
@@ -1725,6 +1751,7 @@ private:
 
     // sanity checks
     rclcpp::TimerBase::SharedPtr watchdog_timer_;
+  rclcpp::TimerBase::SharedPtr spin_timer_;
     bool mocap_enabled_;
     float mocap_min_rate_;
     float mocap_max_rate_;

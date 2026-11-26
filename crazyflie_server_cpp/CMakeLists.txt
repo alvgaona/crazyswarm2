@@ -39,6 +39,7 @@ endif()
 
 target_link_libraries(crazyflie_server
   crazyflie_cpp
+  Eigen3::Eigen
   rclcpp::rclcpp
   tf2_ros::tf2_ros
   ${sensor_msgs_TARGETS}
